@@ -1,0 +1,101 @@
+'\"
+'\" Copyright (c) 2026 Ivan Kanis
+'\"
+'\" See the file "license.terms" for information on usage and redistribution
+'\" of this file, and for a DISCLAIMER OF ALL WARRANTIES.
+'\"
+.TH tcldbg 1 9.1 Tcl "Tcl Applications"
+.so man.macros
+.BS
+'\" Note:  do not modify the .SH NAME line immediately below!
+.SH NAME
+tcldbg \- Command-line debugger for Tcl scripts
+.SH SYNOPSIS
+\fBtcldbg\fR \fIfileName\fR ?\fIarg arg ...\fR?
+.BE
+.SH DESCRIPTION
+.PP
+\fBTcldbg\fR is an interactive command-line debugger for Tcl scripts,
+built on the debugger support commands introduced by TIP 86
+(\fBinfo line\fR, \fBinfo return\fR, \fBtrace execution\fR and
+\fBtrace breakpoint\fR).
+It runs \fIfileName\fR in the same interpreter as the debugger itself,
+stopping at breakpoints and single-stepping at command granularity.
+Any \fIarg\fR arguments are passed to the script through the
+\fBargv\fR variable, exactly as \fBtclsh\fR would.
+.PP
+On startup \fBtcldbg\fR presents its
+.QW \fB(tcldbg)\fR
+prompt without running the script, so that breakpoints may be set
+first; the \fBrun\fR command then sources the script.
+.SH "DEBUGGER COMMANDS"
+.PP
+Command names may be abbreviated to any unique prefix.  An empty input
+line repeats the previous command.  Input that does not match a
+debugger command is evaluated as a Tcl script in the frame in which the
+debuggee is stopped, so ordinary Tcl such as
+\fBset\fR \fIvar\fR or \fBinfo locals\fR works at the prompt.
+.TP
+\fBrun\fR
+Source the script under the debugger.  Reports normal completion or an
+uncaught error, then returns to the prompt.
+.TP
+\fBbreak\fR ?\fIfileName\fB:\fR?\fIline\fR (alias: \fBb\fR)
+Set a breakpoint.  Without \fIfileName\fR the breakpoint is set in the
+main script.  Breakpoints are numbered in order of creation.
+.TP
+\fBdelete\fR ?\fIid id ...\fR?
+Delete the given breakpoints, or all of them if no \fIid\fR is given.
+.TP
+\fBdisable\fR \fIid\fR ?\fIid ...\fR?, \fBenable\fR \fIid\fR ?\fIid ...\fR?
+Disable or re-enable breakpoints without deleting them.
+.TP
+\fBinfo breakpoints\fR
+List all breakpoints with their state.
+.TP
+\fBcontinue\fR (alias: \fBc\fR)
+Resume execution until the next breakpoint or the end of the script.
+.TP
+\fBstep\fR (alias: \fBs\fR)
+Execute one command, descending into procedure calls.  At the initial
+prompt, \fBstep\fR starts the script and stops at its first command.
+.TP
+\fBnext\fR (alias: \fBn\fR)
+Execute one command, stepping over procedure calls.
+.TP
+\fBfinish\fR
+Resume execution until the current procedure returns.
+.TP
+\fBwhere\fR, \fBbt\fR
+Print the call stack of the stopped script.
+.TP
+\fBprint\fR \fIexpr\fR (alias: \fBp\fR)
+Evaluate \fIexpr\fR with \fBexpr\fR in the stopped frame and print the
+result.
+.TP
+\fBlist\fR ?\fIline\fR? (alias: \fBl\fR)
+Show source around the current (or given) line; repeating continues
+forward through the file.
+.TP
+\fBquit\fR (alias: \fBq\fR)
+Exit the debugger, terminating the script if one is running.
+End-of-file at the prompt is equivalent to \fBquit\fR.
+.SH LIMITATIONS
+.PP
+The script runs in the debugger's interpreter, so procedures and global
+variables persist across repeated \fBrun\fR commands.
+.PP
+Breakpoints and stepping rely on the source location information that
+Tcl records for \fBsource\fRd files; dynamically evaluated code (for
+example scripts built with \fBeval\fR) carries no file information and
+cannot be stopped in.
+.PP
+If the script itself reads from standard input, its input and the
+debugger prompt share the same channel.
+.PP
+\fBinfo return\fR reports the empty string when the previous command
+was executed by bytecode-compiled code; see TIP 86.
+.SH "SEE ALSO"
+tclsh(1), info(n), trace(n), source(n)
+.SH KEYWORDS
+breakpoint, debugger, step, trace

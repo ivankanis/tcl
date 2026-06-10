@@ -780,7 +780,7 @@ ZIP_INSTALL_OBJS	= @ZIP_INSTALL_OBJS@
 
 all: binaries libraries doc packages
 
-binaries: ${LIB_FILE} ${TCL_EXE}
+binaries: ${LIB_FILE} ${TCL_EXE} tcldbg$(VERSION)
 
 libraries:
 
@@ -849,6 +849,14 @@ ${TCL_EXE}: ${TCLSH_OBJS} ${TCL_LIB_FILE} ${TCL_STUB_LIB_FILE} ${TCL_ZIP_FILE}
 	    fi; \
 	fi
 
+# The tcldbg debugger is a Tcl script run by the versioned tclsh; the
+# version is substituted here rather than by config.status so the
+# produced file is itself version-suffixed.
+tcldbg$(VERSION): $(UNIX_DIR)/tcldbg.in
+	sed -e 's|@TCL_VERSION[@]|$(VERSION)|g' $(UNIX_DIR)/tcldbg.in \
+		> tcldbg$(VERSION)
+	chmod +x tcldbg$(VERSION)
+
 # Must be empty so it doesn't conflict with rule for ${TCL_EXE} above
 ${NATIVE_TCLSH}:
 
@@ -859,7 +867,8 @@ Makefile: $(UNIX_DIR)/Makefile.in $(DLTEST_DIR)/Makefile.in
 
 clean: clean-packages
 	rm -rf *.a *.o libtcl* core errs *~ \#* TAGS *.E a.out \
-		errors ${TCL_EXE} ${TCLTEST_EXE} lib.exp Tcl @DTRACE_HDR@ \
+		errors ${TCL_EXE} ${TCLTEST_EXE} tcldbg$(VERSION) lib.exp \
+		Tcl @DTRACE_HDR@ \
 		minizip${HOST_EXEEXT} *.${HOST_OBJEXT} *.zip *.vfs
 	(cd dltest ; $(MAKE) clean)
 
@@ -1032,6 +1041,8 @@ install-binaries: binaries
 	@@INSTALL_LIB@
 	@echo "Installing ${TCL_EXE} as $(BIN_INSTALL_DIR)/tclsh$(VERSION)${EXE_SUFFIX}"
 	@$(INSTALL_PROGRAM) ${TCL_EXE} "$(BIN_INSTALL_DIR)/tclsh$(VERSION)${EXE_SUFFIX}"
+	@echo "Installing tcldbg$(VERSION) to $(BIN_INSTALL_DIR)/"
+	@$(INSTALL_PROGRAM) tcldbg$(VERSION) "$(BIN_INSTALL_DIR)/tcldbg$(VERSION)"
 	@echo "Installing tclConfig.sh to $(CONFIG_INSTALL_DIR)/"
 	@$(INSTALL_DATA) tclConfig.sh "$(CONFIG_INSTALL_DIR)/tclConfig.sh"
 	@echo "Installing tclooConfig.sh to $(CONFIG_INSTALL_DIR)/"
@@ -1054,7 +1065,7 @@ install-libraries: libraries
 		$(INSTALL_DATA_DIR) "$$i"; \
 	    fi; \
 	    done;
-	@for i in opt0.4 cookiejar0.2 encoding; \
+	@for i in opt0.4 cookiejar0.2 debugger0.1 encoding; \
 	    do \
 	    if [ ! -d "$(SCRIPT_INSTALL_DIR)/$$i" ] ; then \
 		echo "Making directory $(SCRIPT_INSTALL_DIR)/$$i"; \
@@ -1086,6 +1097,10 @@ install-libraries: libraries
 	@echo "Installing package opt0.4 files to $(SCRIPT_INSTALL_DIR)/opt0.4/"
 	@for i in $(TOP_DIR)/library/opt/*.tcl; do \
 	    $(INSTALL_DATA) $$i "$(SCRIPT_INSTALL_DIR)/opt0.4"; \
+	done
+	@echo "Installing package debugger0.1 files to $(SCRIPT_INSTALL_DIR)/debugger0.1/"
+	@for i in $(TOP_DIR)/library/debugger/*.tcl; do \
+	    $(INSTALL_DATA) $$i "$(SCRIPT_INSTALL_DIR)/debugger0.1"; \
 	done
 	@echo "Installing package msgcat 1.7.1 as a Tcl Module"
 	@$(INSTALL_DATA) $(TOP_DIR)/library/msgcat/msgcat.tcl \

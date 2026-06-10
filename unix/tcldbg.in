@@ -1,0 +1,26 @@
+#!/bin/sh
+# tcldbg --
+#
+# Command-line debugger for Tcl scripts, built on the TIP #86
+# debugger-support commands.  The next line is a comment to Tcl but
+# restarts under the tclsh installed alongside this script for sh: \
+exec "`dirname "$0"`/tclsh@TCL_VERSION@" "$0" ${1+"$@"}
+
+package require debugger
+
+if {[llength $argv] < 1 || [lindex $argv 0] in {-h -help --help}} {
+    puts stderr "usage: tcldbg@TCL_VERSION@ fileName ?arg arg ...?"
+    exit 2
+}
+set script [lindex $argv 0]
+if {![file readable $script]} {
+    puts stderr "tcldbg@TCL_VERSION@: cannot read \"$script\""
+    exit 1
+}
+
+# Make the debuggee see the arguments it would get from tclsh.
+set ::argv [lrange $argv 1 end]
+set ::argc [llength $::argv]
+set ::argv0 $script
+
+::tcl::debugger::start $script

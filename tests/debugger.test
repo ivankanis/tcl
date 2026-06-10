@@ -1,0 +1,207 @@
+# debugger.test --
+#
+# Tests for the "debugger" package (the tcldbg command-line debugger
+# built on the TIP #86 debugger-support commands).
+#
+# See the file "license.terms" for information on usage and redistribution of
+# this file, and for a DISCLAIMER OF ALL WARRANTIES.
+
+if {"::tcltest" ni [namespace children]} {
+    package require tcltest 2.5
+    namespace import -force ::tcltest::*
+}
+
+testConstraint debugger [expr {![catch {package require debugger}]}]
+
+# Drive a full debugger session non-interactively: write the command
+# sequence to a file used as the prompt's input channel, capture the
+# transcript in another file, and return it.
+proc debuggerSession {script commands} {
+    set cmdFile [makeFile $commands dbg-commands.txt]
+    set outFile [makeFile "" dbg-output.txt]
+    set in [open $cmdFile r]
+    set out [open $outFile w]
+    set ::tcl::debugger::exitOnQuit 0
+    ::tcl::debugger::attach $in $out
+    ::tcl::debugger::start $script
+    close $in
+    close $out
+    set f [open $outFile r]
+    set transcript [read $f]
+    close $f
+    removeFile dbg-commands.txt
+    removeFile dbg-output.txt
+    return $transcript
+}
+
+proc debuggerCleanup {} {
+    ::tcl::debugger::Reset
+    set ::tcl::debugger::exitOnQuit 0
+}
+
+# A fixture script with a known layout.
+#
+#   line 1:  proc dbgfix_double {n} {
+#   line 2:      set r [expr {$n * 2}]
+#   line 3:      return $r
+#   line 4:  }
+#   line 5:  set dbgv 1
+#   line 6:  set dbgv [dbgfix_double 21]
+#   line 7:  set dbgv done
+
+set fixtureBody "proc dbgfix_double {n} {\n\
+    set r \[expr {\$n * 2}]\n\
+    return \$r\n\
+}\nset dbgv 1\nset dbgv \[dbgfix_double 21]\nset dbgv done\n"
+set fixtureFile [makeFile $fixtureBody dbg-fixture.tcl]
+set fixtureNorm [file normalize $fixtureFile]
+
+# ---------------------------------------------------------------------------
+# Stop-decision logic (pure helper, synthetic trace tuples)
+# ---------------------------------------------------------------------------
+
+test debugger-1.1 {breakpoint flag stops in any mode} -constraints debugger -body {
+    list [::tcl::debugger::ShouldStop continue 0 5 1] \
+	    [::tcl::debugger::ShouldStop next 1 5 1]
+} -result {breakpoint breakpoint}
+
+test debugger-1.2 {continue mode does not stop without a breakpoint} \
+	-constraints debugger -body {
+    ::tcl::debugger::ShouldStop continue 0 5 0
+} -result {}
+
+test debugger-1.3 {step mode stops everywhere} -constraints debugger -body {
+    list [::tcl::debugger::ShouldStop step 0 1 0] \
+	    [::tcl::debugger::ShouldStop step 0 9 0]
+} -result {step step}
+
+test debugger-1.4 {next mode stops at or above the recorded level} \
+	-constraints debugger -body {
+    list [::tcl::debugger::ShouldStop next 2 3 0] \
+	    [::tcl::debugger::ShouldStop next 2 2 0] \
+	    [::tcl::debugger::ShouldStop next 2 1 0]
+} -result {{} next next}
+
+test debugger-1.5 {finish mode stops only above the recorded level} \
+	-constraints debugger -body {
+    list [::tcl::debugger::ShouldStop finish 1 2 0] \
+	    [::tcl::debugger::ShouldStop finish 1 1 0]
+} -result {{} finish}
+
+# ---------------------------------------------------------------------------
+# Scripted sessions through the REPL
+# ---------------------------------------------------------------------------
+
+test debugger-2.1 {breakpoint, print in the stopped frame, continue} \
+	-constraints debugger -body {
+    # Line 6 is "set dbgv [dbgfix_double 21]"; the trace fires for the
+    # bracketed call and for the outer set, so the breakpoint is hit
+    # twice and two continues are needed to finish the script.
+    set t [debuggerSession $fixtureNorm \
+	    "break $fixtureNorm:6\nrun\nprint \$dbgv\ncontinue\ncontinue\nquit\n"]
+    list [string match "*Breakpoint 1 at $fixtureNorm:6*" $t] \
+	    [string match "*Breakpoint 1, at $fixtureNorm:6*" $t] \
+	    [string match "*(tcldbg) 1\n*" $t] \
+	    [string match "*Script completed.*" $t]
+} -cleanup debuggerCleanup -result {1 1 1 1}
+
+test debugger-2.2 {step descends into a procedure} -constraints debugger -body {
+    set t [debuggerSession $fixtureNorm \
+	    "break $fixtureNorm:6\nrun\nstep\nprint \$n\nquit\n"]
+    # After one step from line 6 we are inside dbgfix_double at line 2,
+    # where $n is the procedure argument.
+    list [string match "*Stopped at $fixtureNorm:2*" $t] \
+	    [string match "*(tcldbg) 21\n*" $t]
+} -cleanup debuggerCleanup -result {1 1}
+
+test debugger-2.3 {next steps over a procedure call} -constraints debugger -body {
+    # next must never stop inside dbgfix_double; two nexts are needed to
+    # get past both line-6 commands (see debugger-2.1), and the stop at
+    # line 7 comes after dbgv received the procedure's result.
+    set t [debuggerSession $fixtureNorm \
+	    "break $fixtureNorm:6\nrun\nnext\nnext\nprint \$dbgv\nquit\n"]
+    list [string match "*$fixtureNorm:2*" $t] \
+	    [string match "*Stopped at $fixtureNorm:7*" $t] \
+	    [string match "*(tcldbg) 42\n*" $t]
+} -cleanup debuggerCleanup -result {0 1 1}
+
+test debugger-2.4 {finish runs to procedure return} -constraints debugger -body {
+    # The breakpoint is deleted before finish so it cannot re-fire on
+    # the second command of line 2.  After the procedure returns, the
+    # first traced caller command is the outer set on line 6.
+    set t [debuggerSession $fixtureNorm \
+	    "break $fixtureNorm:2\nrun\ndelete 1\nfinish\nquit\n"]
+    list [string match "*Breakpoint 1, at $fixtureNorm:2*" $t] \
+	    [string match "*Finished, at $fixtureNorm:6*" $t]
+} -cleanup debuggerCleanup -result {1 1}
+
+test debugger-2.5 {where shows the stopped procedure and its caller} \
+	-constraints debugger -body {
+    set t [debuggerSession $fixtureNorm \
+	    "break $fixtureNorm:2\nrun\nwhere\nquit\n"]
+    list [string match "*#0\tdbgfix_double at $fixtureNorm:2*" $t] \
+	    [string match "*#1\t(toplevel)*" $t]
+} -cleanup debuggerCleanup -result {1 1}
+
+test debugger-2.6 {info breakpoints, disable and delete} \
+	-constraints debugger -body {
+    set t [debuggerSession $fixtureNorm \
+	    "break 5\nbreak 6\ndisable 1\ninfo breakpoints\ndelete\ninfo breakpoints\nquit\n"]
+    list [string match "*1\tn\t$fixtureNorm:5*" $t] \
+	    [string match "*2\ty\t$fixtureNorm:6*" $t] \
+	    [string match "*No breakpoints.*" $t]
+} -cleanup debuggerCleanup -result {1 1 1}
+
+test debugger-2.7 {a disabled breakpoint does not stop the script} \
+	-constraints debugger -body {
+    set t [debuggerSession $fixtureNorm \
+	    "break 6\ndisable 1\nrun\nquit\n"]
+    list [string match "*Breakpoint 1, at*" $t] \
+	    [string match "*Script completed.*" $t]
+} -cleanup debuggerCleanup -result {0 1}
+
+test debugger-2.8 {errors at the prompt do not kill the session} \
+	-constraints debugger -body {
+    set t [debuggerSession $fixtureNorm \
+	    "print \[expr {1/0}\]\nboguscommand12345\nquit\n"]
+    list [string match "*Error: *divide by zero*" $t] \
+	    [string match "*Error: invalid command name*" $t]
+} -cleanup debuggerCleanup -result {1 1}
+
+test debugger-2.9 {plain Tcl input is evaluated in the stopped frame} \
+	-constraints debugger -body {
+    set t [debuggerSession $fixtureNorm \
+	    "break $fixtureNorm:2\nbreak 7\nrun\nset n 100\ncontinue\ncontinue\nprint \$dbgv\nquit\n"]
+    # Overwriting the local n inside dbgfix_double changes its result,
+    # observed at the line-7 breakpoint before dbgv is overwritten.
+    string match "*(tcldbg) 200\n*" $t
+} -cleanup debuggerCleanup -result 1
+
+test debugger-2.10 {list shows source with a current-line marker} \
+	-constraints debugger -body {
+    set t [debuggerSession $fixtureNorm \
+	    "break $fixtureNorm:6\nrun\nlist\nquit\n"]
+    expr {[string first "    6*\tset dbgv " $t] >= 0}
+} -cleanup debuggerCleanup -result 1
+
+test debugger-2.11 {quit while stopped terminates the run} \
+	-constraints debugger -body {
+    set t [debuggerSession $fixtureNorm \
+	    "break $fixtureNorm:6\nrun\nquit\n"]
+    # The script must not reach completion, and the trace must be gone.
+    list [string match "*Script completed.*" $t] [trace execution]
+} -cleanup debuggerCleanup -result {0 {}}
+
+test debugger-2.12 {EOF at the prompt acts as quit} -constraints debugger -body {
+    # The session has no quit command; hitting end-of-file must end it.
+    # The breakpoint set before EOF survives (quit only removes the
+    # trace) and is removed by the cleanup.
+    debuggerSession $fixtureNorm "break 6\n"
+    llength [trace breakpoint]
+} -cleanup debuggerCleanup -result 3
+
+# ---------------------------------------------------------------------------
+
+removeFile dbg-fixture.tcl
+cleanupTests
+return

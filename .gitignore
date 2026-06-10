@@ -26,6 +26,7 @@ manifest.uuid
 _FOSSIL_
 */tclConfig.sh
 */tclsh*
+*/tcldbg[0-9]*
 */tcltest
 */versions.vc
 */version.vc
