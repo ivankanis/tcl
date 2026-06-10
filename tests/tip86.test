@@ -1,0 +1,274 @@
+# tip86.test --
+#
+# Tests for TIP #86 "Improved Debugger Support": the [info line],
+# [info return], [trace execution] and [trace breakpoint] commands.
+#
+# This port reuses the TIP #280 CmdFrame stack for line/file information.
+#
+# See the file "license.terms" for information on usage and redistribution of
+# this file, and for a DISCLAIMER OF ALL WARRANTIES.
+
+if {"::tcltest" ni [namespace children]} {
+    package require tcltest 2.5
+    namespace import -force ::tcltest::*
+}
+
+# A script file with a known line layout, used by the [info line] tests.
+#
+#   line 1:  # header comment
+#   line 2:  (blank)
+#   line 3:  proc tip86::sample {a b} {
+#   line 4:      set s [expr {$a + $b}]
+#   line 5:      return $s
+#   line 6:  }
+#   line 7:  proc tip86::other {} { return ok }
+
+set sampleBody "# header comment\n\
+\nproc tip86_sample {a b} {\n\
+    set s \[expr {\$a + \$b}]\n\
+    return \$s\n\
+}\n\
+proc tip86_other {} { return ok }\n"
+
+set sampleFile [makeFile $sampleBody tip86-sample.tcl]
+source $sampleFile
+
+# A harmless execution-trace target. Because [trace execution] installs an
+# interpreter-wide trace that fires on every command (including the test
+# harness), targets used purely to exercise get/set semantics must be real
+# commands that quietly accept the appended trace arguments.
+proc ::tip86noop args {}
+
+# ---------------------------------------------------------------------------
+# info line number / file / find
+# ---------------------------------------------------------------------------
+
+test tip86-1.1 {info line number of a sourced proc} -body {
+    info line number tip86_sample
+} -result 3
+
+test tip86-1.2 {info line number of a second proc} -body {
+    info line number tip86_other
+} -result 7
+
+test tip86-1.3 {info line file of a sourced proc} -body {
+    info line file tip86_sample
+} -result $sampleFile
+
+test tip86-1.4 {info line number of a non-procedure errors} -body {
+    info line number no_such_proc_here
+} -returnCodes error -result {"no_such_proc_here" isn't a procedure}
+
+test tip86-1.5 {info line find locates the enclosing proc} -body {
+    info line find $sampleFile 4
+} -result ::tip86_sample
+
+test tip86-1.6 {info line find on a line above any proc finds nothing} -body {
+    info line find $sampleFile 1
+} -result {}
+
+test tip86-1.7 {info line find in an unknown file finds nothing} -body {
+    info line find /no/such/file 4
+} -result {}
+
+# ---------------------------------------------------------------------------
+# info line current / level
+# ---------------------------------------------------------------------------
+
+test tip86-2.1 {info line current returns a {line file} pair} -setup {
+    set probe [makeFile "set ::tip86current \[info line current]\n" \
+	    tip86-probe.tcl]
+} -body {
+    source $probe
+    list [lindex $::tip86current 0] [lindex $::tip86current 1]
+} -cleanup {
+    removeFile tip86-probe.tcl
+    unset -nocomplain ::tip86current
+} -result [list 1 [file normalize [makeFile "" tip86-probe.tcl]]]
+
+test tip86-2.2 {info line current is a 2-element list} -body {
+    llength [info line current]
+} -result 2
+
+test tip86-2.3 {info line level current with no args} -body {
+    llength [info line level]
+} -result 2
+
+test tip86-2.4 {info line bad subcommand errors} -body {
+    info line bogus
+} -returnCodes error -match glob -result {bad subcommand "bogus":*}
+
+# ---------------------------------------------------------------------------
+# info line relativeerror
+# ---------------------------------------------------------------------------
+
+test tip86-3.1 {info line relativeerror defaults to 0} -body {
+    info line relativeerror
+} -result 0
+
+test tip86-3.2 {info line relativeerror round-trips a boolean} -body {
+    info line relativeerror 1
+    set r [info line relativeerror]
+    info line relativeerror 0
+    set r
+} -result 1
+
+test tip86-3.3 {info line relativeerror rejects non-booleans} -body {
+    info line relativeerror notabool
+} -returnCodes error -match glob -result {expected boolean*}
+
+# ---------------------------------------------------------------------------
+# trace execution
+# ---------------------------------------------------------------------------
+
+test tip86-4.1 {trace execution with no target reports the empty default} -body {
+    trace execution
+} -result {}
+
+test tip86-4.2 {trace execution sets and reports its target} -body {
+    trace execution ::tip86noop
+    set r [trace execution]
+    trace execution {}
+    set r
+} -result ::tip86noop
+
+test tip86-4.3 {trace execution {} removes the trace} -body {
+    trace execution ::tip86noop
+    trace execution {}
+    trace execution
+} -result {}
+
+test tip86-4.4 {trace execution fires a command callback per command} -setup {
+    set ::tip86hits {}
+    proc ::tip86dbg {line file nest stack ns cmd command flags} {
+	lappend ::tip86hits [list $line $command $flags]
+    }
+} -body {
+    trace execution ::tip86dbg
+    set zzz 1
+    incr zzz
+    trace execution {}
+    # Each traced top-level command contributes one record; check the
+    # commands we ran appear with their line/flags.
+    set seen {}
+    foreach h $::tip86hits {
+	if {[lindex $h 1] in {{set zzz 1} {incr zzz}}} {
+	    lappend seen [lindex $h 1] [lindex $h 2]
+	}
+    }
+    set seen
+} -cleanup {
+    rename ::tip86dbg {}
+    unset -nocomplain ::tip86hits
+} -result {{set zzz 1} 0 {incr zzz} 0}
+
+test tip86-4.5 {trace execution to a channel writes records} -setup {
+    set out [makeFile "" tip86-trace.out]
+    set ch [open $out w]
+} -body {
+    trace execution $ch
+    set qq 5
+    trace execution {}
+    close $ch
+    set fd [open $out r]
+    set data [read $fd]
+    close $fd
+    # Look for the "set qq 5" record; field 6 (0-based 5) is the command list.
+    set found 0
+    foreach line [split $data \n] {
+	if {[llength $line] >= 8 && [lindex $line 6] eq "set qq 5"} {
+	    set found 1
+	}
+    }
+    set found
+} -cleanup {
+    removeFile tip86-trace.out
+} -result 1
+
+test tip86-4.6 {trace execution rejects a bad level} -body {
+    trace execution target notanint
+} -returnCodes error -match glob -result {*}
+
+# ---------------------------------------------------------------------------
+# trace breakpoint
+# ---------------------------------------------------------------------------
+
+test tip86-5.1 {trace breakpoint starts empty} -body {
+    trace breakpoint
+} -result {}
+
+test tip86-5.2 {trace breakpoint add, list and query} -body {
+    trace breakpoint 10 myfile.tcl 1
+    set lst [trace breakpoint]
+    set state [trace breakpoint 10 myfile.tcl]
+    trace breakpoint 10 myfile.tcl {}
+    list $lst $state [trace breakpoint]
+} -result {{10 myfile.tcl 1} 1 {}}
+
+test tip86-5.3 {trace breakpoint query of a missing breakpoint errors} -body {
+    trace breakpoint 999 nope.tcl
+} -returnCodes error -result {breakpoint not found}
+
+test tip86-5.4 {trace breakpoint update changes state} -body {
+    trace breakpoint 20 f.tcl 1
+    trace breakpoint 20 f.tcl 5
+    set s [trace breakpoint 20 f.tcl]
+    trace breakpoint 20 f.tcl {}
+    set s
+} -result 5
+
+test tip86-5.5 {a breakpoint sets the trace flag bit on its line} -setup {
+    set bpScript [makeFile "set bpv 1\nset bpv 2\nset bpv 3\n" tip86-bp.tcl]
+    set ::tip86bpflags {}
+    proc ::tip86bpdbg {line file nest stack ns cmd command flags} {
+	if {$flags} {
+	    lappend ::tip86bpflags $line
+	}
+    }
+} -body {
+    trace breakpoint 2 [file normalize $bpScript] 1
+    trace execution ::tip86bpdbg
+    source $bpScript
+    trace execution {}
+    trace breakpoint 2 [file normalize $bpScript] {}
+    set ::tip86bpflags
+} -cleanup {
+    rename ::tip86bpdbg {}
+    removeFile tip86-bp.tcl
+    unset -nocomplain ::tip86bpflags
+} -result 2
+
+# ---------------------------------------------------------------------------
+# info return
+#
+# NOTE: under Tcl 9's bytecode engine the result of the previous command lives
+# on the operand stack, not in the interpreter result, at the point an
+# execution trace fires. [info return] therefore reflects the interpreter
+# result at that moment and is the empty string in compiled contexts. It must
+# never error.
+# ---------------------------------------------------------------------------
+
+test tip86-6.1 {info return is empty outside a trace} -body {
+    info return
+} -result {}
+
+test tip86-6.2 {info return does not error inside an execution trace} -setup {
+    set ::tip86ret absent
+    proc ::tip86retdbg {line file nest stack ns cmd command flags} {
+	set ::tip86ret [info return]
+    }
+} -body {
+    trace execution ::tip86retdbg
+    set rv 1
+    trace execution {}
+    # We only require that it produced a string without error.
+    string is print -strict "x$::tip86ret"
+} -cleanup {
+    rename ::tip86retdbg {}
+    unset -nocomplain ::tip86ret
+} -result 1
+
+# ---------------------------------------------------------------------------
+
+cleanupTests
+return

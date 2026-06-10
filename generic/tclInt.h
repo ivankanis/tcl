@@ -1977,6 +1977,21 @@ typedef struct AllocCache {
 } AllocCache;
 
 /*
+ * TIP #86: a single execution breakpoint. Breakpoints are kept in a linked
+ * list hanging off Interp.tip86Breakpoints and are consulted by the
+ * execution-trace callback (see tclTrace.c).
+ */
+
+typedef struct Tip86Breakpoint {
+    Tcl_Obj *fileName;		/* Normalized file the breakpoint is in. */
+    int lineNum;		/* Line number within the file. */
+    int state;			/* <=0 disabled; N>0 triggers every Nth hit. */
+    int counter;		/* Hit counter, used when state > 1. */
+    struct Tip86Breakpoint *next;
+				/* Next breakpoint in the list, or NULL. */
+} Tip86Breakpoint;
+
+/*
  *----------------------------------------------------------------
  * This structure defines an interpreter, which is a collection of commands
  * plus other state information related to interpreting commands, such as
@@ -2328,6 +2343,30 @@ typedef struct Interp {
     Tcl_Obj *innerLiteral;	/* "INNER" literal for [info errorstack] */
     Tcl_Obj *innerContext;	/* cached list for fast reallocation */
     int resetErrorStack;	/* controls cleaning up of ::errorStack */
+
+    /*
+     * TIP #86 IMPLEMENTATION  -  Improved debugger support.
+     *
+     * State backing the [trace execution], [trace breakpoint], [info line]
+     * and [info return] commands. Line/file information is sourced from the
+     * TIP #280 CmdFrame stack (iPtr->cmdFramePtr) rather than maintained
+     * separately. See tclTrace.c and tclCmdIL.c.
+     */
+
+    Tcl_Obj *tip86TraceCmd;	/* Target command/channel for [trace
+				 * execution], or NULL when no execution trace
+				 * is active. */
+    Tcl_Trace tip86TraceId;	/* Trace token for tip86TraceCmd, or NULL. */
+    int tip86TraceLevel;	/* Nesting level at/under which the execution
+				 * trace fires (0 means trace everything). */
+    int tip86InTrace;		/* Non-zero while inside the execution-trace
+				 * callback; prevents recursive tracing. */
+    int tip86RelError;		/* Non-zero to report relative (not absolute)
+				 * line numbers on procedure errors. */
+    Tcl_Obj *tip86LastResult;	/* Saved result of the previously executed
+				 * command, for [info return]. */
+    struct Tip86Breakpoint *tip86Breakpoints;
+				/* Linked list of execution breakpoints. */
 
 #ifdef TCL_COMPILE_STATS
     /*
@@ -3507,6 +3546,9 @@ MODULE_SCOPE Tcl_Obj *	TclIncrObjVar2(Tcl_Interp *interp, Tcl_Obj *part1Ptr,
 MODULE_SCOPE Tcl_ObjCmdProc2 TclInfoExistsCmd;
 MODULE_SCOPE Tcl_ObjCmdProc2 TclInfoCoroutineCmd;
 MODULE_SCOPE Tcl_Obj *	TclInfoFrame(Tcl_Interp *interp, CmdFrame *framePtr);
+MODULE_SCOPE void	TclTip86GetLineFile(Tcl_Interp *interp,
+			    CmdFrame *framePtr, Tcl_Obj **lineObjPtr,
+			    Tcl_Obj **fileObjPtr);
 MODULE_SCOPE Tcl_ObjCmdProc2 TclInfoGlobalsCmd;
 MODULE_SCOPE Tcl_ObjCmdProc2 TclInfoLocalsCmd;
 MODULE_SCOPE Tcl_ObjCmdProc2 TclInfoVarsCmd;

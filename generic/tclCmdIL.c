@@ -129,6 +129,9 @@ static Tcl_ObjCmdProc2	InfoFunctionsCmd;
 static Tcl_ObjCmdProc2	InfoHostnameCmd;
 static Tcl_ObjCmdProc2	InfoLevelCmd;
 static Tcl_ObjCmdProc2	InfoLibraryCmd;
+/* TIP #86 - New 'info' subcommands 'line' and 'return' */
+static Tcl_ObjCmdProc2	InfoLineCmd;
+static Tcl_ObjCmdProc2	InfoReturnCmd;
 static Tcl_ObjCmdProc2	InfoLoadedCmd;
 static Tcl_ObjCmdProc2	InfoNameOfExecutableCmd;
 static Tcl_ObjCmdProc2	InfoPatchLevelCmd;
@@ -168,11 +171,13 @@ const EnsembleImplMap tclInfoImplMap[] = {
     {"hostname",	   InfoHostnameCmd,	    TclCompileBasic0ArgCmd, NULL, NULL, 0},
     {"level",		   InfoLevelCmd,	    TclCompileInfoLevelCmd, NULL, NULL, 0},
     {"library",		   InfoLibraryCmd,	    TclCompileBasic0ArgCmd, NULL, NULL, 0},
+    {"line",		   InfoLineCmd,		    TclCompileBasicMin1ArgCmd, NULL, NULL, 0},
     {"loaded",		   InfoLoadedCmd,	    TclCompileBasic0Or1ArgCmd, NULL, NULL, 0},
     {"locals",		   TclInfoLocalsCmd,	    TclCompileBasic0Or1ArgCmd, NULL, NULL, 0},
     {"nameofexecutable",   InfoNameOfExecutableCmd, TclCompileBasic0ArgCmd, NULL, NULL, 1},
     {"patchlevel",	   InfoPatchLevelCmd,	    TclCompileBasic0ArgCmd, NULL, NULL, 0},
     {"procs",		   InfoProcsCmd,	    TclCompileBasic0Or1ArgCmd, NULL, NULL, 0},
+    {"return",		   InfoReturnCmd,	    TclCompileBasic0ArgCmd, NULL, NULL, 0},
     {"script",		   InfoScriptCmd,	    TclCompileBasic0Or1ArgCmd, NULL, NULL, 0},
     {"sharedlibextension", InfoSharedlibCmd,	    TclCompileBasic0ArgCmd, NULL, NULL, 0},
     {"tclversion",	   InfoTclVersionCmd,	    TclCompileBasic0ArgCmd, NULL, NULL, 0},
@@ -1423,6 +1428,369 @@ TclInfoFrame(
     }
     return tmpObj;
 }
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * TclTip86GetLineFile --
+ *
+ *	TIP #86 helper. Given a CmdFrame (typically iPtr->cmdFramePtr),
+ *	produce the source line number and file name of the command it
+ *	describes. This reuses the TIP #280 machinery in TclInfoFrame()
+ *	rather than maintaining a separate line-tracking mechanism.
+ *
+ * Results:
+ *	*lineObjPtr and *fileObjPtr are set to Tcl_Objs with their reference
+ *	counts incremented; the caller must Tcl_DecrRefCount() them (or hand
+ *	them to a container that takes its own reference). The line is 0 and
+ *	the file empty when no location is available for the frame.
+ *
+ *----------------------------------------------------------------------
+ */
+
+void
+TclTip86GetLineFile(
+    Tcl_Interp *interp,		/* Current interpreter. */
+    CmdFrame *framePtr,		/* Frame to describe (may be NULL). */
+    Tcl_Obj **lineObjPtr,	/* Out: line number object. */
+    Tcl_Obj **fileObjPtr)	/* Out: file name object. */
+{
+    Tcl_Obj *dictObj, *key, *val;
+
+    dictObj = TclInfoFrame(interp, framePtr);
+    Tcl_IncrRefCount(dictObj);
+
+    TclNewLiteralStringObj(key, "line");
+    Tcl_IncrRefCount(key);
+    val = NULL;
+    Tcl_DictObjGet(NULL, dictObj, key, &val);
+    *lineObjPtr = (val != NULL) ? val : Tcl_NewWideIntObj(0);
+    Tcl_IncrRefCount(*lineObjPtr);
+    Tcl_DecrRefCount(key);
+
+    TclNewLiteralStringObj(key, "file");
+    Tcl_IncrRefCount(key);
+    val = NULL;
+    Tcl_DictObjGet(NULL, dictObj, key, &val);
+    *fileObjPtr = (val != NULL) ? val : Tcl_NewObj();
+    Tcl_IncrRefCount(*fileObjPtr);
+    Tcl_DecrRefCount(key);
+
+    Tcl_DecrRefCount(dictObj);
+}
+
+/*
+ * Tip86ProcLineFile --
+ *	Fetch the definition line and/or file of a procedure from the TIP #280
+ *	per-proc location table (iPtr->linePBodyPtr). Returns 1 if location
+ *	information is available, 0 otherwise. The file object (if requested)
+ *	is borrowed - its reference count is not adjusted.
+ */
+
+static int
+Tip86ProcLineFile(
+    Interp *iPtr,
+    Proc *procPtr,
+    int *lineNumPtr,		/* Out, may be NULL. */
+    Tcl_Obj **fileObjPtr)	/* Out, may be NULL; borrowed reference. */
+{
+    Tcl_HashEntry *hePtr;
+    CmdFrame *cfPtr;
+
+    hePtr = Tcl_FindHashEntry(iPtr->linePBodyPtr, procPtr);
+    if (hePtr == NULL) {
+	return 0;
+    }
+    cfPtr = (CmdFrame *) Tcl_GetHashValue(hePtr);
+    if (cfPtr == NULL) {
+	return 0;
+    }
+    if (lineNumPtr != NULL) {
+	*lineNumPtr = (cfPtr->line && cfPtr->nline > 0) ? (int) cfPtr->line[0] : 0;
+    }
+    if (fileObjPtr != NULL) {
+	*fileObjPtr = (cfPtr->type == TCL_LOCATION_SOURCE)
+		? cfPtr->data.eval.path : NULL;
+    }
+    return 1;
+}
+
+/*
+ * Tip86FindProcByLine --
+ *	Search a namespace (and its children, recursively) for a procedure
+ *	defined in file fileObj at or before line lineNum. On success sets
+ *	*procNameObjPtr to a fresh fully-qualified name object and returns 1.
+ */
+
+static int
+Tip86FindProcByLine(
+    Interp *iPtr,
+    Tcl_Obj *fileObj,
+    int lineNum,
+    Namespace *nsPtr,
+    Tcl_Obj **procNameObjPtr)
+{
+    Tcl_HashEntry *entryPtr;
+    Tcl_HashSearch search;
+    const char *wantFile = TclGetString(fileObj);
+
+    if (nsPtr == NULL) {
+	return 0;
+    }
+    for (entryPtr = Tcl_FirstHashEntry(&nsPtr->cmdTable, &search);
+	    entryPtr != NULL; entryPtr = Tcl_NextHashEntry(&search)) {
+	Command *cmdPtr = (Command *) Tcl_GetHashValue(entryPtr);
+	Proc *procPtr = TclIsProc(cmdPtr);
+	int defLine = 0;
+	Tcl_Obj *defFile = NULL;
+
+	if (procPtr == NULL) {
+	    continue;
+	}
+	if (!Tip86ProcLineFile(iPtr, procPtr, &defLine, &defFile)
+		|| defFile == NULL) {
+	    continue;
+	}
+	if (strcmp(wantFile, TclGetString(defFile)) == 0 && lineNum >= defLine) {
+	    Tcl_Obj *nameObj = Tcl_NewStringObj(nsPtr->fullName, -1);
+
+	    if (nsPtr->parentPtr != NULL) {
+		Tcl_AppendToObj(nameObj, "::", 2);
+	    }
+	    Tcl_AppendToObj(nameObj,
+		    (char *) Tcl_GetHashKey(&nsPtr->cmdTable, entryPtr), -1);
+	    *procNameObjPtr = nameObj;
+	    return 1;
+	}
+    }
+    for (entryPtr = Tcl_FirstHashEntry(&nsPtr->childTable, &search);
+	    entryPtr != NULL; entryPtr = Tcl_NextHashEntry(&search)) {
+	Namespace *childPtr = (Namespace *) Tcl_GetHashValue(entryPtr);
+
+	if (Tip86FindProcByLine(iPtr, fileObj, lineNum, childPtr,
+		procNameObjPtr)) {
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * InfoLineCmd --
+ *
+ *	TIP #86. Implements "info line", giving debuggers runtime access to
+ *	source line/file information:
+ *
+ *	    info line current		-> {line file} of current command
+ *	    info line level ?level?	-> {line file} for a stack level
+ *	    info line number procname	-> definition line of a procedure
+ *	    info line file procname	-> definition file of a procedure
+ *	    info line find file line	-> procedure defined at file/line
+ *	    info line relativeerror ?b?	-> get/set relative-error reporting
+ *
+ *	Line/file data is sourced from the TIP #280 CmdFrame stack.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+InfoLineCmd(
+    TCL_UNUSED(void *),
+    Tcl_Interp *interp,
+    Tcl_Size objc,
+    Tcl_Obj *const *objv)
+{
+    Interp *iPtr = (Interp *) interp;
+    int index;
+    static const char *const options[] = {
+	"current", "file", "find", "level", "number", "relativeerror", NULL
+    };
+    enum lineOptions {
+	LINE_CURRENT, LINE_FILE, LINE_FIND, LINE_LEVEL, LINE_NUMBER,
+	LINE_RELERROR
+    };
+
+    if (objc < 2) {
+	Tcl_WrongNumArgs(interp, 1, objv, "subcommand ?arg ...?");
+	return TCL_ERROR;
+    }
+    if (Tcl_GetIndexFromObj(interp, objv[1], options, "subcommand", 0,
+	    &index) != TCL_OK) {
+	return TCL_ERROR;
+    }
+
+    switch ((enum lineOptions) index) {
+    case LINE_CURRENT: {
+	Tcl_Obj *lineObj, *fileObj, *resultObj;
+
+	if (objc != 2) {
+	    Tcl_WrongNumArgs(interp, 2, objv, NULL);
+	    return TCL_ERROR;
+	}
+	TclTip86GetLineFile(interp, iPtr->cmdFramePtr, &lineObj, &fileObj);
+	resultObj = Tcl_NewListObj(0, NULL);
+	Tcl_ListObjAppendElement(NULL, resultObj, lineObj);
+	Tcl_ListObjAppendElement(NULL, resultObj, fileObj);
+	Tcl_DecrRefCount(lineObj);
+	Tcl_DecrRefCount(fileObj);
+	Tcl_SetObjResult(interp, resultObj);
+	return TCL_OK;
+    }
+
+    case LINE_LEVEL: {
+	CmdFrame *framePtr = iPtr->cmdFramePtr;
+	int level, topLevel = (framePtr != NULL) ? framePtr->level : 0;
+	Tcl_Obj *lineObj, *fileObj, *resultObj;
+
+	if (objc != 2 && objc != 3) {
+	    Tcl_WrongNumArgs(interp, 2, objv, "?level?");
+	    return TCL_ERROR;
+	}
+	if (objc == 3) {
+	    if (TclGetIntFromObj(interp, objv[2], &level) != TCL_OK) {
+		return TCL_ERROR;
+	    }
+	    if ((level > topLevel) || (level <= -topLevel)) {
+	    levelError:
+		Tcl_SetObjResult(interp, Tcl_ObjPrintf("bad level \"%s\"",
+			TclGetString(objv[2])));
+		Tcl_SetErrorCode(interp, "TCL", "LOOKUP", "LEVEL",
+			TclGetString(objv[2]), (char *)NULL);
+		return TCL_ERROR;
+	    }
+	    if (level > 0) {
+		level -= topLevel;
+	    }
+	    while (++level <= 0) {
+		framePtr = framePtr->nextPtr;
+		if (framePtr == NULL) {
+		    goto levelError;
+		}
+	    }
+	}
+	TclTip86GetLineFile(interp, framePtr, &lineObj, &fileObj);
+	resultObj = Tcl_NewListObj(0, NULL);
+	Tcl_ListObjAppendElement(NULL, resultObj, lineObj);
+	Tcl_ListObjAppendElement(NULL, resultObj, fileObj);
+	Tcl_DecrRefCount(lineObj);
+	Tcl_DecrRefCount(fileObj);
+	Tcl_SetObjResult(interp, resultObj);
+	return TCL_OK;
+    }
+
+    case LINE_NUMBER: {
+	Proc *procPtr;
+	int lineNum = 0;
+
+	if (objc != 3) {
+	    Tcl_WrongNumArgs(interp, 2, objv, "procname");
+	    return TCL_ERROR;
+	}
+	procPtr = TclFindProc(iPtr, TclGetString(objv[2]));
+	if (procPtr == NULL) {
+	    Tcl_SetObjResult(interp, Tcl_ObjPrintf("\"%s\" isn't a procedure",
+		    TclGetString(objv[2])));
+	    return TCL_ERROR;
+	}
+	if (Tip86ProcLineFile(iPtr, procPtr, &lineNum, NULL)) {
+	    Tcl_SetObjResult(interp, Tcl_NewWideIntObj(lineNum));
+	}
+	return TCL_OK;
+    }
+
+    case LINE_FILE: {
+	Proc *procPtr;
+	Tcl_Obj *fileObj = NULL;
+
+	if (objc != 3) {
+	    Tcl_WrongNumArgs(interp, 2, objv, "procname");
+	    return TCL_ERROR;
+	}
+	procPtr = TclFindProc(iPtr, TclGetString(objv[2]));
+	if (procPtr == NULL) {
+	    Tcl_SetObjResult(interp, Tcl_ObjPrintf("\"%s\" isn't a procedure",
+		    TclGetString(objv[2])));
+	    return TCL_ERROR;
+	}
+	if (Tip86ProcLineFile(iPtr, procPtr, NULL, &fileObj)
+		&& (fileObj != NULL)) {
+	    Tcl_SetObjResult(interp, fileObj);
+	}
+	return TCL_OK;
+    }
+
+    case LINE_FIND: {
+	int lineNum;
+	Tcl_Obj *resultObj = NULL;
+
+	if (objc != 4) {
+	    Tcl_WrongNumArgs(interp, 2, objv, "filename line");
+	    return TCL_ERROR;
+	}
+	if (TclGetIntFromObj(interp, objv[3], &lineNum) != TCL_OK) {
+	    return TCL_ERROR;
+	}
+	if (Tip86FindProcByLine(iPtr, objv[2], lineNum, iPtr->globalNsPtr,
+		&resultObj)) {
+	    Tcl_SetObjResult(interp, resultObj);
+	}
+	return TCL_OK;
+    }
+
+    case LINE_RELERROR: {
+	int boolVal;
+
+	if (objc != 2 && objc != 3) {
+	    Tcl_WrongNumArgs(interp, 2, objv, "?boolean?");
+	    return TCL_ERROR;
+	}
+	if (objc == 3) {
+	    if (Tcl_GetBooleanFromObj(interp, objv[2], &boolVal) != TCL_OK) {
+		return TCL_ERROR;
+	    }
+	    iPtr->tip86RelError = boolVal;
+	}
+	Tcl_SetObjResult(interp, Tcl_NewBooleanObj(iPtr->tip86RelError));
+	return TCL_OK;
+    }
+    }
+    return TCL_OK;		/* Not reached. */
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * InfoReturnCmd --
+ *
+ *	TIP #86. Implements "info return", returning the saved result of the
+ *	command executed immediately before the current one while an
+ *	execution trace ([trace execution]) is active. Outside an execution
+ *	trace the result is the empty string.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+InfoReturnCmd(
+    TCL_UNUSED(void *),
+    Tcl_Interp *interp,
+    Tcl_Size objc,
+    Tcl_Obj *const *objv)
+{
+    Interp *iPtr = (Interp *) interp;
+
+    if (objc != 1) {
+	Tcl_WrongNumArgs(interp, 1, objv, NULL);
+	return TCL_ERROR;
+    }
+    if (iPtr->tip86LastResult != NULL) {
+	Tcl_SetObjResult(interp, iPtr->tip86LastResult);
+    }
+    return TCL_OK;
+}
+
 
 /*
  *----------------------------------------------------------------------

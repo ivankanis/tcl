@@ -375,6 +375,54 @@ associated with the trace.  If \fIname\fR does not exist or does not
 have any traces set, then the result of the command will be an empty
 string.
 .RE
+.\" METHOD: execution (TIP 86)
+.TP
+\fBtrace execution \fR?\fItarget\fR ?\fIlevel\fR??
+.
+TIP #86 debugger support. Establishes a single interpreter-wide execution
+trace, intended as a foundation for debuggers. With no arguments, returns the
+current \fItarget\fR. If \fItarget\fR is the empty string (or \fB0\fR) the
+execution trace is removed. \fIlevel\fR defaults to 0, meaning trace every
+command; a non-zero \fIlevel\fR limits tracing to commands at or below that
+nesting level, although active breakpoints (see \fBtrace breakpoint\fR) always
+fire regardless of level.
+.RS
+.PP
+If \fItarget\fR is the name of a channel open for writing, each trace record is
+written to it as a list followed by a newline. Otherwise \fItarget\fR is
+treated as a command prefix to which the following arguments are appended
+before it is evaluated:
+.IP \fIline\fR
+The source line number the command begins on.
+.IP \fIfile\fR
+The normalized source file name (empty for dynamically evaluated code).
+.IP \fInestlevel\fR
+The command nesting level.
+.IP \fIstacklevel\fR
+The stack level, as reported by \fBinfo level\fR.
+.IP \fIcurnsfunc\fR
+The current fully-qualified namespace or procedure.
+.IP \fIcmdname\fR
+The fully-qualified name of the command about to be invoked.
+.IP \fIcommand\fR
+The command and its arguments, as a list.
+.IP \fIflags\fR
+Bit flags; bit 0 is set when a breakpoint matched the current line.
+.PP
+Line and file information is sourced from the same TIP #280 machinery used by
+\fBinfo frame\fR.
+.RE
+.\" METHOD: breakpoint (TIP 86)
+.TP
+\fBtrace breakpoint \fR?\fIline file\fR ?\fIstate\fR? \fR...?
+.
+TIP #86 debugger support. Manages breakpoints that force an execution trace to
+fire even when its \fIlevel\fR would otherwise suppress it. With no arguments,
+returns a flat list of \fIline file state\fR triples for all breakpoints. With
+\fIline file\fR, returns the state of that breakpoint. With \fIline file
+state\fR (repeatable), creates or updates breakpoints: a \fIstate\fR \(<= 0
+disables the breakpoint, \fIN\fR > 0 triggers on every \fIN\fRth hit, and an
+empty \fIstate\fR string deletes it.
 .SH EXAMPLES
 .PP
 Print a message whenever either of the global variables \fBfoo\fR and

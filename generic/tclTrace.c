@@ -94,7 +94,8 @@ enum TraceCommandInfoFlags {
  */
 
 typedef enum TraceOptions {
-    TRACE_ADD, TRACE_INFO, TRACE_REMOVE
+    TRACE_ADD, TRACE_INFO, TRACE_REMOVE,
+    TRACE_EXECUTION, TRACE_BREAKPOINT	/* TIP #86 */
 } TraceOptions;
 typedef int (Tcl_TraceTypeObjCmd)(Tcl_Interp *interp, TraceOptions optionIndex,
 	Tcl_Size objc, Tcl_Obj *const *objv);
@@ -142,6 +143,12 @@ static void		StringTraceDeleteProc(void *clientData);
 static void		DisposeTraceResult(int flags, char *result);
 static int		TraceVarEx(Tcl_Interp *interp, const char *part1,
 			    const char *part2, VarTrace *tracePtr);
+/* TIP #86 - Improved debugger support. */
+static int		Tip86TraceExecutionCmd(Tcl_Interp *interp,
+			    Tcl_Size objc, Tcl_Obj *const *objv);
+static int		Tip86TraceBreakpointCmd(Tcl_Interp *interp,
+			    Tcl_Size objc, Tcl_Obj *const *objv);
+static Tcl_CmdObjTraceProc2 Tip86ExecProc;
 
 /*
  * The following structure holds the client data for string-based
@@ -199,6 +206,7 @@ Tcl_TraceObjCmd(
     /* Main sub commands to 'trace' */
     static const char *const traceOptions[] = {
 	"add", "info", "remove",
+	"execution", "breakpoint",	/* TIP #86 */
 	NULL
     };
     TraceOptions optionIndex;
@@ -256,6 +264,10 @@ Tcl_TraceObjCmd(
 	}
 	return traceSubCmds[typeIndex](interp, optionIndex, objc, objv);
     }
+    case TRACE_EXECUTION:	/* TIP #86 */
+	return Tip86TraceExecutionCmd(interp, objc, objv);
+    case TRACE_BREAKPOINT:	/* TIP #86 */
+	return Tip86TraceBreakpointCmd(interp, objc, objv);
     default:
 	TCL_UNREACHABLE();
     }
@@ -3118,3 +3130,357 @@ TraceVarEx(
  * fill-column: 78
  * End:
  */
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Tip86ExecProc --
+ *
+ *	TIP #86. Command-trace callback installed by [trace execution]. For
+ *	each command it assembles a trace record and either writes it to the
+ *	target channel or appends it as arguments to the target command and
+ *	evaluates it. The record (appended to the target) is:
+ *
+ *	    line file nestlevel stacklevel curnsfunc cmdname command flags
+ *
+ *	Source line/file come from the TIP #280 CmdFrame stack. "flags" has
+ *	bit 0 set when a breakpoint matched the current line/file.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+Tip86ExecProc(
+    void *clientData,
+    Tcl_Interp *interp,
+    Tcl_Size level,
+    TCL_UNUSED(const char *),	/* command */
+    Tcl_Command commandInfo,
+    Tcl_Size objc,
+    Tcl_Obj *const *objv)
+{
+    Interp *iPtr = (Interp *) clientData;
+    Tcl_Obj *lineObj, *fileObj, *listObj, *nsObj, *cmdNameObj;
+    Tcl_Obj **targetv;
+    Tcl_Size targetc;
+    Tcl_Channel channel = NULL;
+    Tcl_InterpState state;
+    CallFrame *vf;
+    Tip86Breakpoint *bp;
+    int mode = 0, result = TCL_OK, bpFlag = 0, curLine = 0;
+
+    if (iPtr->tip86InTrace || iPtr->tip86TraceCmd == NULL) {
+	return TCL_OK;
+    }
+
+    /*
+     * Capture the result of the previously executed command (the current
+     * interpreter result) for [info return], before running the target.
+     */
+
+    if (iPtr->tip86LastResult != NULL) {
+	Tcl_DecrRefCount(iPtr->tip86LastResult);
+    }
+    iPtr->tip86LastResult = Tcl_DuplicateObj(Tcl_GetObjResult(interp));
+    Tcl_IncrRefCount(iPtr->tip86LastResult);
+
+    state = Tcl_SaveInterpState(interp, TCL_OK);
+
+    /*
+     * Source line and file of the command that is about to execute.
+     */
+
+    TclTip86GetLineFile(interp, iPtr->cmdFramePtr, &lineObj, &fileObj);
+    TclGetIntFromObj(NULL, lineObj, &curLine);
+
+    /*
+     * Evaluate breakpoints against the current line/file.
+     */
+
+    for (bp = iPtr->tip86Breakpoints; bp != NULL; bp = bp->next) {
+	if (bp->state > 0 && bp->lineNum == curLine && strcmp(
+		TclGetString(bp->fileName), TclGetString(fileObj)) == 0) {
+	    if (((bp->counter = (bp->counter + 1) % bp->state)) == 0) {
+		bpFlag = 1;
+		break;
+	    }
+	}
+    }
+
+    /*
+     * Respect the requested nesting level: above it, fire only on a
+     * breakpoint hit.
+     */
+
+    if (iPtr->tip86TraceLevel != 0 && level > iPtr->tip86TraceLevel
+	    && !bpFlag) {
+	Tcl_DecrRefCount(lineObj);
+	Tcl_DecrRefCount(fileObj);
+	Tcl_RestoreInterpState(interp, state);
+	return TCL_OK;
+    }
+
+    if (Tcl_ListObjGetElements(interp, iPtr->tip86TraceCmd, &targetc,
+	    &targetv) != TCL_OK) {
+	Tcl_DecrRefCount(lineObj);
+	Tcl_DecrRefCount(fileObj);
+	Tcl_DiscardInterpState(state);
+	return TCL_ERROR;
+    }
+
+    /*
+     * If the target is a single writable channel, emit to it; otherwise treat
+     * the target as a command prefix.
+     */
+
+    if (targetc == 1) {
+	channel = Tcl_GetChannel(interp, TclGetString(targetv[0]), &mode);
+	if (channel != NULL && !(mode & TCL_WRITABLE)) {
+	    channel = NULL;
+	}
+    }
+    if (channel != NULL) {
+	listObj = Tcl_NewListObj(0, NULL);
+    } else {
+	listObj = Tcl_NewListObj(targetc, targetv);
+    }
+    Tcl_IncrRefCount(listObj);
+
+    Tcl_ListObjAppendElement(NULL, listObj, lineObj);
+    Tcl_ListObjAppendElement(NULL, listObj, fileObj);
+    Tcl_DecrRefCount(lineObj);
+    Tcl_DecrRefCount(fileObj);
+    Tcl_ListObjAppendElement(NULL, listObj, Tcl_NewWideIntObj(level));
+
+    vf = iPtr->varFramePtr;
+    Tcl_ListObjAppendElement(NULL, listObj,
+	    Tcl_NewWideIntObj(vf ? vf->level : 0));
+
+    if (vf == NULL) {
+	nsObj = Tcl_NewStringObj("::", -1);
+    } else if (vf->isProcCallFrame & FRAME_IS_PROC) {
+	Tcl_Command f = Tcl_GetCommandFromObj(interp, vf->objv[0]);
+
+	nsObj = Tcl_NewObj();
+	if (f != NULL) {
+	    Tcl_GetCommandFullName(interp, f, nsObj);
+	}
+    } else if (vf->nsPtr != NULL) {
+	nsObj = Tcl_NewStringObj(vf->nsPtr->fullName, -1);
+    } else {
+	nsObj = Tcl_NewObj();
+    }
+    Tcl_ListObjAppendElement(NULL, listObj, nsObj);
+
+    cmdNameObj = Tcl_NewObj();
+    if (commandInfo != NULL) {
+	Tcl_GetCommandFullName(interp, commandInfo, cmdNameObj);
+    }
+    Tcl_ListObjAppendElement(NULL, listObj, cmdNameObj);
+
+    Tcl_ListObjAppendElement(NULL, listObj, Tcl_NewListObj(objc, objv));
+    Tcl_ListObjAppendElement(NULL, listObj, Tcl_NewWideIntObj(bpFlag));
+
+    iPtr->tip86InTrace = 1;
+    if (channel != NULL) {
+	if (Tcl_WriteObj(channel, listObj) < 0
+		|| Tcl_WriteChars(channel, "\n", 1) < 0) {
+	    /*
+	     * I/O error: tear the execution trace down so we don't loop.
+	     */
+
+	    if (iPtr->tip86TraceId != NULL) {
+		Tcl_DeleteTrace(interp, iPtr->tip86TraceId);
+		iPtr->tip86TraceId = NULL;
+	    }
+	    if (iPtr->tip86TraceCmd != NULL) {
+		Tcl_DecrRefCount(iPtr->tip86TraceCmd);
+		iPtr->tip86TraceCmd = NULL;
+	    }
+	}
+	Tcl_RestoreInterpState(interp, state);
+    } else {
+	result = Tcl_EvalObjEx(interp, listObj, TCL_EVAL_DIRECT);
+	if (result == TCL_OK) {
+	    Tcl_RestoreInterpState(interp, state);
+	} else {
+	    Tcl_DiscardInterpState(state);
+	}
+    }
+    iPtr->tip86InTrace = 0;
+    Tcl_DecrRefCount(listObj);
+    return result;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Tip86TraceExecutionCmd --
+ *
+ *	TIP #86. Implements [trace execution ?target ?level??]. With no target
+ *	returns the current target. An empty target (or "0") removes the
+ *	execution trace. Otherwise installs an interpreter-wide command trace
+ *	(Tip86ExecProc). "level" limits tracing to commands at or below that
+ *	nesting level (0, the default, traces everything); breakpoints still
+ *	fire above the level.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+Tip86TraceExecutionCmd(
+    Tcl_Interp *interp,
+    Tcl_Size objc,
+    Tcl_Obj *const *objv)
+{
+    Interp *iPtr = (Interp *) interp;
+    int level = 0;
+    Tcl_Size strLen;
+    const char *target;
+
+    if (objc == 2) {
+	if (iPtr->tip86TraceCmd != NULL) {
+	    Tcl_SetObjResult(interp, iPtr->tip86TraceCmd);
+	}
+	return TCL_OK;
+    }
+    if (objc != 3 && objc != 4) {
+	Tcl_WrongNumArgs(interp, 2, objv, "?command ?level??");
+	return TCL_ERROR;
+    }
+    if (objc == 4 && TclGetIntFromObj(interp, objv[3], &level) != TCL_OK) {
+	return TCL_ERROR;
+    }
+
+    if (iPtr->tip86TraceId != NULL) {
+	Tcl_DeleteTrace(interp, iPtr->tip86TraceId);
+	iPtr->tip86TraceId = NULL;
+    }
+    if (iPtr->tip86TraceCmd != NULL) {
+	Tcl_DecrRefCount(iPtr->tip86TraceCmd);
+	iPtr->tip86TraceCmd = NULL;
+    }
+
+    target = TclGetStringFromObj(objv[2], &strLen);
+    if (strLen > 0 && strcmp(target, "0") != 0) {
+	iPtr->tip86TraceCmd = objv[2];
+	Tcl_IncrRefCount(iPtr->tip86TraceCmd);
+	iPtr->tip86TraceLevel = level;
+	iPtr->tip86TraceId = Tcl_CreateObjTrace2(interp, 0, 0,
+		Tip86ExecProc, iPtr, NULL);
+    }
+    return TCL_OK;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Tip86TraceBreakpointCmd --
+ *
+ *	TIP #86. Implements [trace breakpoint ??line file ?state? ...?].
+ *
+ *	  - With no extra arguments, returns a flat list of {line file state}
+ *	    triples describing all breakpoints.
+ *	  - "line file" queries the state of one breakpoint.
+ *	  - "line file state ..." creates/updates breakpoints. A state <= 0
+ *	    disables a breakpoint; N > 0 triggers every Nth hit; an empty
+ *	    state string deletes the breakpoint.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+Tip86TraceBreakpointCmd(
+    Tcl_Interp *interp,
+    Tcl_Size objc,
+    Tcl_Obj *const *objv)
+{
+    Interp *iPtr = (Interp *) interp;
+    Tip86Breakpoint *bp;
+    int idx;
+
+    if (objc == 2) {
+	Tcl_Obj *listObj = Tcl_NewListObj(0, NULL);
+
+	for (bp = iPtr->tip86Breakpoints; bp != NULL; bp = bp->next) {
+	    Tcl_ListObjAppendElement(NULL, listObj,
+		    Tcl_NewWideIntObj(bp->lineNum));
+	    Tcl_ListObjAppendElement(NULL, listObj, bp->fileName);
+	    Tcl_ListObjAppendElement(NULL, listObj,
+		    Tcl_NewWideIntObj(bp->state));
+	}
+	Tcl_SetObjResult(interp, listObj);
+	return TCL_OK;
+    }
+    if (objc == 3) {
+	Tcl_WrongNumArgs(interp, 2, objv, "?line file ?state? ...?");
+	return TCL_ERROR;
+    }
+
+    idx = 2;
+    while (idx + 1 < objc) {
+	int lineNum;
+	Tcl_Obj *fileObj;
+
+	if (TclGetIntFromObj(interp, objv[idx], &lineNum) != TCL_OK) {
+	    return TCL_ERROR;
+	}
+	fileObj = objv[idx + 1];
+
+	for (bp = iPtr->tip86Breakpoints; bp != NULL; bp = bp->next) {
+	    if (bp->lineNum == lineNum && strcmp(TclGetString(bp->fileName),
+		    TclGetString(fileObj)) == 0) {
+		break;
+	    }
+	}
+
+	if (idx + 2 >= objc) {
+	    /*
+	     * "line file" with no state: query.
+	     */
+
+	    if (bp == NULL) {
+		Tcl_SetObjResult(interp,
+			Tcl_NewStringObj("breakpoint not found", -1));
+		Tcl_SetErrorCode(interp, "TCL", "LOOKUP", "BREAKPOINT",
+			(char *)NULL);
+		return TCL_ERROR;
+	    }
+	    Tcl_SetObjResult(interp, Tcl_NewWideIntObj(bp->state));
+	    return TCL_OK;
+	}
+
+	if (bp == NULL) {
+	    bp = (Tip86Breakpoint *) Tcl_Alloc(sizeof(Tip86Breakpoint));
+	    bp->next = iPtr->tip86Breakpoints;
+	    iPtr->tip86Breakpoints = bp;
+	    bp->lineNum = lineNum;
+	    bp->fileName = fileObj;
+	    Tcl_IncrRefCount(bp->fileName);
+	    bp->state = 0;
+	}
+	bp->counter = 0;
+
+	if (TclGetString(objv[idx + 2])[0] == '\0') {
+	    /*
+	     * Empty state string: delete the breakpoint.
+	     */
+
+	    Tip86Breakpoint **linkPtr = &iPtr->tip86Breakpoints;
+
+	    while (*linkPtr != NULL && *linkPtr != bp) {
+		linkPtr = &(*linkPtr)->next;
+	    }
+	    if (*linkPtr == bp) {
+		*linkPtr = bp->next;
+	    }
+	    Tcl_DecrRefCount(bp->fileName);
+	    Tcl_Free(bp);
+	} else if (TclGetIntFromObj(interp, objv[idx + 2],
+		&bp->state) != TCL_OK) {
+	    return TCL_ERROR;
+	}
+	idx += 3;
+    }
+    return TCL_OK;
+}

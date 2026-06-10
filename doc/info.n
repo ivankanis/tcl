@@ -280,6 +280,48 @@ list.  See \fBuplevel\fR for more information on levels.
 .
 Returns the value of \fBtcl_library\fR, which is the name of the library
 directory in which the scripts distributed with Tcl scripts are stored.
+.\" METHOD: line
+.TP
+\fBinfo line \fIsubcommand \fR?\fIarg ...\fR?
+.
+TIP #86 debugger support. Gives runtime access to the source line and file
+information that Tcl maintains for commands and procedures. The line and file
+data are derived from the same machinery as \fBinfo frame\fR. The following
+subcommands are defined:
+.RS
+.TP
+\fBinfo line current\fR
+.
+Returns a two-element list \fB{\fIline file\fB}\fR giving the source line
+number and file name of the command currently being evaluated.
+.TP
+\fBinfo line level \fR?\fIlevel\fR?
+.
+Returns the \fB{\fIline file\fB}\fR pair for the command frame at the given
+\fIlevel\fR (numbered as for \fBinfo frame\fR). With no argument, the current
+frame is used.
+.TP
+\fBinfo line number \fIprocname\fR
+.
+For a procedure defined while sourcing a file, returns the line number on
+which it was defined. Returns the empty string if no location is known.
+.TP
+\fBinfo line file \fIprocname\fR
+.
+For a procedure defined while sourcing a file, returns the name of that file.
+Returns the empty string if no location is known.
+.TP
+\fBinfo line find \fIfile line\fR
+.
+Returns the fully-qualified name of the procedure defined in \fIfile\fR at or
+before \fIline\fR, or the empty string if none is found.
+.TP
+\fBinfo line relativeerror \fR?\fIboolean\fR?
+.
+Gets or sets a flag controlling whether procedure errors report relative
+rather than absolute line numbers. The flag is stored on the interpreter and
+defaults to false.
+.RE
 .\" METHOD: loaded
 .TP
 \fBinfo loaded \fR?\fIinterp\fR? ?\fIprefix\fR?
@@ -324,6 +366,20 @@ only those names that match according to \fBstring match\fR.  Only the final
 component in \fIpattern\fR is actually considered a pattern.  Any qualifying
 components simply select a namespace.  See \fBNAMESPACE RESOLUTION\fR in the
 \fBnamespace\fR(n) documentation.
+.\" METHOD: return
+.TP
+\fBinfo return\fR
+.
+TIP #86 debugger support. While an execution trace established with
+\fBtrace execution\fR is active, returns the saved result of the previously
+executed command. Outside an execution trace it returns the empty string.
+.RS
+.PP
+Note: because Tcl 9 executes most code as bytecode, the result of the previous
+command is generally held on the internal operand stack rather than in the
+interpreter result at the point an execution trace fires. In those contexts
+\fBinfo return\fR yields the empty string.
+.RE
 .\" METHOD: script
 .TP
 \fBinfo script\fR ?\fIfilename\fR?

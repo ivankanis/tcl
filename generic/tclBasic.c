@@ -891,6 +891,19 @@ Tcl_CreateInterp(void)
     Tcl_InitHashTable(iPtr->lineLABCPtr, TCL_ONE_WORD_KEYS);
     iPtr->scriptCLLocPtr = NULL;
 
+    /*
+     * TIP #86: improved debugger support. Initialize execution-trace,
+     * breakpoint and saved-result state to "inactive".
+     */
+
+    iPtr->tip86TraceCmd = NULL;
+    iPtr->tip86TraceId = NULL;
+    iPtr->tip86TraceLevel = 0;
+    iPtr->tip86InTrace = 0;
+    iPtr->tip86RelError = 0;
+    iPtr->tip86LastResult = NULL;
+    iPtr->tip86Breakpoints = NULL;
+
     iPtr->activeVarTracePtr = NULL;
 
     iPtr->returnOpts = NULL;
@@ -2087,6 +2100,30 @@ DeleteInterpProc(
      */
 
     TclDeleteLiteralTable(interp, &iPtr->literalTable);
+
+    /*
+     * TIP #86 - Release execution-trace target, saved result, and the
+     * breakpoint list. The trace token itself is owned by the trace
+     * machinery and is torn down with the other traces.
+     */
+
+    if (iPtr->tip86TraceCmd != NULL) {
+	Tcl_DecrRefCount(iPtr->tip86TraceCmd);
+	iPtr->tip86TraceCmd = NULL;
+    }
+    if (iPtr->tip86LastResult != NULL) {
+	Tcl_DecrRefCount(iPtr->tip86LastResult);
+	iPtr->tip86LastResult = NULL;
+    }
+    while (iPtr->tip86Breakpoints != NULL) {
+	Tip86Breakpoint *bpPtr = iPtr->tip86Breakpoints;
+
+	iPtr->tip86Breakpoints = bpPtr->next;
+	if (bpPtr->fileName != NULL) {
+	    Tcl_DecrRefCount(bpPtr->fileName);
+	}
+	Tcl_Free(bpPtr);
+    }
 
     /*
      * TIP #280 - Release the arrays for ByteCode/Proc extension, and
